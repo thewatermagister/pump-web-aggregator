@@ -1,167 +1,234 @@
 // server.js
+// Pump Web Aggregator: 1 upstream WS → many downstream website clients
+
 const express = require("express");
+const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 
 const app = express();
-app.use(require("cors")());
+app.use(cors());
+app.use(express.json());
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+// ====== CONFIG ======
+const PORT = process.env.PORT || 8080;
 
-// ---- CONFIG ----
-const PUMP_URI = "wss://pumpportal.fun/api/data";
-const MAX_ROWS = 250;              // how many rows we keep in memory
-const BROADCAST_EVERY_MS = 150;    // batch updates to clients (prevents UI spam)
-// ----------------
+// Upstream PumpPortal socket (this matches the methods you saw in your error)
+// Docs/examples commonly use:
+const UPSTREAM_WS = process.env.UPSTREAM_WS || "wss://pumpportal.fun/api/data";
 
-let pumpWS = null;
-let pumpConnected = false;
+// How many rows to keep in memory for new clients ("batch" send)
+const CACHE_LIMIT = Number(process.env.CACHE_LIMIT || 200);
 
-let rows = [];               // newest first
-let pendingBatch = [];       // rows waiting to broadcast
-let subscribers = new Set(); // downstream clients
+// How many *recent tokens* we auto-subscribe to for trades
+// (important: subscribing to every token forever will explode)
+const TRADE_SUB_LIMIT = Number(process.env.TRADE_SUB_LIMIT || 150);
 
-function safeSend(ws, obj) {
-  try {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch {}
+// Optional: only subscribe trades after a token is created AND it passes this SOL filter (create event sol)
+const MIN_SOL_CREATE_TO_TRACK = Number(process.env.MIN_SOL_CREATE_TO_TRACK || 0);
+
+// Reconnect timing
+const RECONNECT_MS = Number(process.env.RECONNECT_MS || 2000);
+
+// ====== STATE ======
+let upstream = null;
+let upstreamConnected = false;
+
+const downstreamClients = new Set();
+
+// Rolling cache of normalized rows
+const cachedRows = [];
+
+// Keep track of which mints we already subscribed to for trades
+const subscribedTradeMints = new Set();
+// Also keep insertion order so we can drop oldest
+const subscribedTradeQueue = [];
+
+// ====== HELPERS ======
+function pushCache(row) {
+  cachedRows.push(row);
+  if (cachedRows.length > CACHE_LIMIT) cachedRows.shift();
 }
 
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
-  for (const client of subscribers) {
-    try {
-      if (client.readyState === WebSocket.OPEN) client.send(msg);
-    } catch {}
+  for (const client of downstreamClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(msg);
+      } catch (e) {
+        // ignore send errors
+      }
+    }
   }
 }
 
-// Health endpoint (handy for debugging / deployment)
+function normCreate(msg) {
+  // PumpPortal create/new token event usually contains:
+  // mint, trader (deployer), solAmount, name, symbol, timestamp (varies)
+  // We'll normalize what we can.
+  return {
+    kind: "create",
+    t: Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    trader: msg.trader || msg.owner || msg.deployer || "",
+    sol: Number(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || msg.tokenName || "",
+    symbol: msg.symbol || msg.ticker || "",
+    raw: msg,
+  };
+}
+
+function normTrade(msg) {
+  // PumpPortal trade event commonly includes:
+  // mint, trader, txType ("buy"/"sell"), solAmount, timestamp
+  return {
+    kind: "trade",
+    t: Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    trader: msg.trader || msg.owner || "",
+    side: (msg.txType || msg.side || "").toLowerCase(), // buy/sell
+    sol: Number(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || "",
+    symbol: msg.symbol || "",
+    raw: msg,
+  };
+}
+
+function maybeSubscribeTrade(mint) {
+  if (!mint) return;
+  if (subscribedTradeMints.has(mint)) return;
+
+  // Enforce limit: drop oldest from our tracking sets (no "unsubscribe" call assumed)
+  subscribedTradeMints.add(mint);
+  subscribedTradeQueue.push(mint);
+
+  while (subscribedTradeQueue.length > TRADE_SUB_LIMIT) {
+    const oldest = subscribedTradeQueue.shift();
+    subscribedTradeMints.delete(oldest);
+    // Note: PumpPortal may or may not support "unsubscribe" methods.
+    // We simply stop caring about old mints; upstream may keep sending if it doesn't support unsubscribe.
+  }
+
+  if (upstream && upstream.readyState === WebSocket.OPEN) {
+    const payload = { method: "subscribeTokenTrade", keys: [mint] };
+    try {
+      upstream.send(JSON.stringify(payload));
+    } catch (e) {}
+  }
+}
+
+function connectUpstream() {
+  if (upstream && (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  console.log("[UPSTREAM] Connecting:", UPSTREAM_WS);
+  upstream = new WebSocket(UPSTREAM_WS);
+
+  upstream.on("open", () => {
+    upstreamConnected = true;
+    console.log("[UPSTREAM] Connected");
+
+    // 1) Always subscribe to new token creation events
+    try {
+      upstream.send(JSON.stringify({ method: "subscribeNewToken" }));
+    } catch (e) {}
+
+    // Optional ping to keep some proxies happy
+    // (ws auto-handles ping/pong at protocol level, but this is harmless)
+    if (!upstream._keepAlive) {
+      upstream._keepAlive = setInterval(() => {
+        try {
+          if (upstream && upstream.readyState === WebSocket.OPEN) upstream.ping();
+        } catch (e) {}
+      }, 25000);
+    }
+  });
+
+  upstream.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      return;
+    }
+
+    // Detect create vs trade:
+    // PumpPortal trade messages often include txType.
+    const isTrade = typeof msg.txType === "string" || msg.type === "trade";
+
+    if (isTrade) {
+      const row = normTrade(msg);
+      pushCache(row);
+      broadcast({ type: "row", row });
+      return;
+    }
+
+    // Otherwise treat as "create/new token"
+    const row = normCreate(msg);
+
+    // Optional filter: only subscribe trades for tokens above some deploy SOL
+    if (row.sol >= MIN_SOL_CREATE_TO_TRACK) {
+      maybeSubscribeTrade(row.mint);
+    }
+
+    pushCache(row);
+    broadcast({ type: "row", row });
+  });
+
+  upstream.on("close", () => {
+    console.log("[UPSTREAM] Closed");
+    upstreamConnected = false;
+    try {
+      if (upstream && upstream._keepAlive) clearInterval(upstream._keepAlive);
+    } catch (e) {}
+    upstream = null;
+    setTimeout(connectUpstream, RECONNECT_MS);
+  });
+
+  upstream.on("error", (err) => {
+    console.log("[UPSTREAM] Error:", err?.message || err);
+    upstreamConnected = false;
+    // Let "close" handle reconnect; some errors don’t trigger close immediately.
+  });
+}
+
+// ====== DOWNSTREAM WS SERVER ======
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: "/ws" });
+
+wss.on("connection", (ws) => {
+  downstreamClients.add(ws);
+
+  // Send initial snapshot
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "batch",
+        rows: cachedRows.slice(-CACHE_LIMIT),
+      })
+    );
+  } catch (e) {}
+
+  ws.on("close", () => downstreamClients.delete(ws));
+  ws.on("error", () => downstreamClients.delete(ws));
+});
+
+// ====== HTTP ROUTES ======
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    pumpConnected,
-    clients: subscribers.size,
-    cachedRows: rows.length,
+    pumpConnected: upstreamConnected,
+    clients: downstreamClients.size,
+    cachedRows: cachedRows.length,
+    tradeSubLimit: TRADE_SUB_LIMIT,
+    trackingMints: subscribedTradeMints.size,
   });
 });
 
-// Serve initial cache
-app.get("/snapshot", (req, res) => {
-  res.json({ rows });
-});
-
-// Downstream WS for website clients
-wss.on("connection", (client) => {
-  subscribers.add(client);
-
-  // Immediately send current status + snapshot
-  safeSend(client, { type: "status", pumpConnected, clients: subscribers.size });
-  safeSend(client, { type: "snapshot", rows });
-
-  client.on("close", () => {
-    subscribers.delete(client);
-    broadcast({ type: "status", pumpConnected, clients: subscribers.size });
-  });
-});
-
-// Batch broadcaster (prevents blasting clients on high-volume tokens)
-setInterval(() => {
-  if (pendingBatch.length > 0) {
-    const batch = pendingBatch.splice(0, pendingBatch.length);
-    broadcast({ type: "batch", rows: batch });
-  }
-}, BROADCAST_EVERY_MS);
-
-// ---- PumpPortal upstream connection (ONE connection) ----
-function connectPump() {
-  pumpWS = new WebSocket(PUMP_URI);
-
-  pumpWS.on("open", () => {
-    pumpConnected = true;
-    console.log("[PUMP] connected");
-
-    // Subscribe to new token creations
-    pumpWS.send(JSON.stringify({ method: "subscribeNewToken" }));
-
-    broadcast({ type: "status", pumpConnected, clients: subscribers.size });
-  });
-
-  pumpWS.on("message", (buf) => {
-    let data;
-    try {
-      data = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
-    // PumpPortal sometimes returns an error wrapper
-    if (data?.errors) {
-      console.log("[PUMP] error:", data.errors);
-      return;
-    }
-
-    const txType = data?.txType || "N/A";
-
-    // Keep it simple for test page:
-    // - show creates
-    // - show buys/sells *only if we subscribed to those mints* (optional later)
-    if (txType === "create") {
-      const row = {
-        kind: "create",
-        t: Date.now(),
-        trader: data.traderPublicKey || "N/A",
-        mint: data.mint || "N/A",
-        sol: Number(data.solAmount || 0),
-        name: data.name || "N/A",
-        symbol: data.symbol || "N/A",
-      };
-
-      // cache
-      rows.unshift(row);
-      if (rows.length > MAX_ROWS) rows.pop();
-
-      // queue broadcast
-      pendingBatch.unshift(row);
-    }
-
-    if (txType === "buy" || txType === "sell") {
-      const row = {
-        kind: txType,
-        t: Date.now(),
-        trader: data.traderPublicKey || "N/A",
-        mint: data.mint || "N/A",
-        sol: Number(data.solAmount || 0),
-        name: data.name || "N/A",
-        symbol: data.symbol || "N/A",
-      };
-
-      rows.unshift(row);
-      if (rows.length > MAX_ROWS) rows.pop();
-
-      pendingBatch.unshift(row);
-    }
-  });
-
-  pumpWS.on("close", () => {
-    pumpConnected = false;
-    console.log("[PUMP] disconnected. reconnecting in 2s...");
-    broadcast({ type: "status", pumpConnected, clients: subscribers.size });
-    setTimeout(connectPump, 2000);
-  });
-
-  pumpWS.on("error", (err) => {
-    pumpConnected = false;
-    console.log("[PUMP] ws error:", err.message);
-    try { pumpWS.close(); } catch {}
-  });
-}
-
-connectPump();
-
-// Start server
-const PORT = process.env.PORT || 8080;
+// ====== START ======
 server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`[HTTP] Listening on :${PORT}`);
+  connectUpstream();
 });
