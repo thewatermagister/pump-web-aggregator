@@ -1,6 +1,8 @@
 // server.js
 // Pump Web Aggregator: 1 upstream WS → many downstream website clients
-// Sends BOTH create + trade rows, with trade.side = "buy" | "sell" so UI can filter Buys/Sells/All.
+// Streams BOTH:
+//   - kind:"create" (new token)
+//   - kind:"trade"  (buy/sell trades with side:"buy"|"sell")
 
 const express = require("express");
 const cors = require("cors");
@@ -17,13 +19,13 @@ const PORT = process.env.PORT || 8080;
 // PumpPortal upstream
 const UPSTREAM_WS = process.env.UPSTREAM_WS || "wss://pumpportal.fun/api/data";
 
-// Cache last N rows for new clients
+// Cache for new clients
 const CACHE_LIMIT = Number(process.env.CACHE_LIMIT || 200);
 
-// How many recent mints we will subscribe to for trades
+// How many recent mints to subscribe for trades (cap to prevent runaway)
 const TRADE_SUB_LIMIT = Number(process.env.TRADE_SUB_LIMIT || 150);
 
-// Optional: only subscribe to trades after a create >= this SOL
+// Only auto-subscribe to trades for tokens whose CREATE sol >= this
 const MIN_SOL_CREATE_TO_TRACK = Number(process.env.MIN_SOL_CREATE_TO_TRACK || 0);
 
 // Reconnect timing
@@ -36,7 +38,7 @@ let upstreamConnected = false;
 const downstreamClients = new Set();
 const cachedRows = [];
 
-// Track trade subscriptions (best-effort; upstream may not support unsubscribe)
+// Track subscribed mints for trade stream
 const subscribedTradeMints = new Set();
 const subscribedTradeQueue = [];
 
@@ -52,58 +54,66 @@ function broadcast(obj) {
     if (client.readyState === WebSocket.OPEN) {
       try {
         client.send(msg);
-      } catch (_) {}
+      } catch {
+        // ignore
+      }
     }
   }
 }
 
-function safeNum(v, fallback = 0) {
+function num(v) {
   const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function pick(obj, keys, fallback = "") {
-  for (const k of keys) {
-    if (obj && obj[k] != null && obj[k] !== "") return obj[k];
-  }
-  return fallback;
+  return Number.isFinite(n) ? n : 0;
 }
 
 function normCreate(msg) {
   return {
     kind: "create",
-    t: Date.now(),
-    mint: pick(msg, ["mint", "tokenAddress", "ca", "address"], ""),
-    trader: pick(msg, ["trader", "owner", "deployer", "wallet"], ""),
-    sol: safeNum(pick(msg, ["solAmount", "sol", "amountSol"], 0), 0),
-    name: pick(msg, ["name", "tokenName"], ""),
-    symbol: pick(msg, ["symbol", "ticker"], ""),
+    t: msg.timestamp ? Number(msg.timestamp) : Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    trader: msg.trader || msg.owner || msg.deployer || "",
+    sol: num(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || msg.tokenName || "",
+    symbol: msg.symbol || msg.ticker || "",
     raw: msg,
   };
+}
+
+function detectSide(msg) {
+  // Most common: msg.txType = "buy"/"sell"
+  if (typeof msg.txType === "string") {
+    const s = msg.txType.toLowerCase();
+    if (s.includes("buy")) return "buy";
+    if (s.includes("sell")) return "sell";
+  }
+
+  // Sometimes: msg.side = "buy"/"sell"
+  if (typeof msg.side === "string") {
+    const s = msg.side.toLowerCase();
+    if (s.includes("buy")) return "buy";
+    if (s.includes("sell")) return "sell";
+  }
+
+  // Sometimes booleans:
+  if (msg.isBuy === true) return "buy";
+  if (msg.isSell === true) return "sell";
+
+  // Unknown
+  return "";
 }
 
 function normTrade(msg) {
-  const sideRaw = String(pick(msg, ["txType", "side", "tradeType", "direction"], "")).toLowerCase();
-  const side = sideRaw.includes("buy") ? "buy" : sideRaw.includes("sell") ? "sell" : "";
-
   return {
     kind: "trade",
-    t: Date.now(),
-    mint: pick(msg, ["mint", "tokenAddress", "ca", "address"], ""),
-    trader: pick(msg, ["trader", "owner", "wallet"], ""),
-    side, // "buy" | "sell" | ""
-    sol: safeNum(pick(msg, ["solAmount", "sol", "amountSol"], 0), 0),
-    name: pick(msg, ["name", "tokenName"], ""),
-    symbol: pick(msg, ["symbol", "ticker"], ""),
+    t: msg.timestamp ? Number(msg.timestamp) : Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    trader: msg.trader || msg.owner || msg.wallet || "",
+    side: detectSide(msg), // "buy" | "sell" | ""
+    sol: num(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || "",
+    symbol: msg.symbol || "",
     raw: msg,
   };
-}
-
-function sendUpstream(payload) {
-  if (!upstream || upstream.readyState !== WebSocket.OPEN) return;
-  try {
-    upstream.send(JSON.stringify(payload));
-  } catch (_) {}
 }
 
 function maybeSubscribeTrade(mint) {
@@ -113,32 +123,30 @@ function maybeSubscribeTrade(mint) {
   subscribedTradeMints.add(mint);
   subscribedTradeQueue.push(mint);
 
-  // enforce cap
+  // Drop oldest if over limit
   while (subscribedTradeQueue.length > TRADE_SUB_LIMIT) {
     const oldest = subscribedTradeQueue.shift();
     subscribedTradeMints.delete(oldest);
-
-    // If PumpPortal ever supports unsub:
-    // sendUpstream({ method: "unsubscribeTokenTrade", keys: [oldest] });
-    // For now, we just stop tracking it locally.
+    // NOTE: we do not attempt upstream "unsubscribe" because API support varies.
+    // This keeps OUR tracking bounded; upstream may keep sending older ones anyway.
   }
 
-  sendUpstream({ method: "subscribeTokenTrade", keys: [mint] });
-}
-
-// Detect message type from PumpPortal
-function isTradeMessage(msg) {
-  // Common patterns: txType exists, or explicit type:"trade"
-  if (!msg || typeof msg !== "object") return false;
-  if (typeof msg.txType === "string") return true;
-  if (String(msg.type || "").toLowerCase() === "trade") return true;
-  // Some payloads might include "side" or "direction"
-  if (typeof msg.side === "string" || typeof msg.direction === "string") return true;
-  return false;
+  if (upstream && upstream.readyState === WebSocket.OPEN) {
+    const payload = { method: "subscribeTokenTrade", keys: [mint] };
+    try {
+      upstream.send(JSON.stringify(payload));
+    } catch {
+      // ignore
+    }
+  }
 }
 
 function connectUpstream() {
-  if (upstream && (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING)) {
+  if (
+    upstream &&
+    (upstream.readyState === WebSocket.OPEN ||
+      upstream.readyState === WebSocket.CONNECTING)
+  ) {
     return;
   }
 
@@ -149,22 +157,17 @@ function connectUpstream() {
     upstreamConnected = true;
     console.log("[UPSTREAM] Connected");
 
-    // Subscribe to creates
-    sendUpstream({ method: "subscribeNewToken" });
+    // Always subscribe to new token creation
+    try {
+      upstream.send(JSON.stringify({ method: "subscribeNewToken" }));
+    } catch {}
 
-    // Re-subscribe trades for what we're tracking (helps after reconnect)
-    // (This is safe even if duplicates; we de-dupe locally)
-    const mints = Array.from(subscribedTradeMints);
-    for (let i = 0; i < mints.length; i += 50) {
-      sendUpstream({ method: "subscribeTokenTrade", keys: mints.slice(i, i + 50) });
-    }
-
-    // Keepalive ping (some proxies/timeouts)
+    // Keepalive ping
     if (!upstream._keepAlive) {
       upstream._keepAlive = setInterval(() => {
         try {
           if (upstream && upstream.readyState === WebSocket.OPEN) upstream.ping();
-        } catch (_) {}
+        } catch {}
       }, 25000);
     }
   });
@@ -173,37 +176,32 @@ function connectUpstream() {
     let msg;
     try {
       msg = JSON.parse(data.toString());
-    } catch (_) {
+    } catch {
       return;
     }
 
-    // If PumpPortal returns an error about methods, surface it
-    // Example: { error: "...", message: "Invalid message. 'method' must be ..." }
-    if (msg && (msg.error || (typeof msg.message === "string" && msg.message.toLowerCase().includes("invalid message")))) {
-      console.log("[UPSTREAM] Error payload:", msg);
-      return;
-    }
+    // Trade detection: txType present OR explicit type
+    const isTrade =
+      typeof msg.txType === "string" ||
+      msg.type === "trade" ||
+      msg.event === "trade" ||
+      msg.isBuy === true ||
+      msg.isSell === true;
 
-    if (isTradeMessage(msg)) {
+    if (isTrade) {
       const row = normTrade(msg);
 
-      // If we somehow got a trade for a mint we aren't tracking, optionally start tracking it
-      // (usually not needed; trades should only arrive after subscribeTokenTrade)
-      if (row.mint && !subscribedTradeMints.has(row.mint)) {
-        // don't auto-add here; could be spammy. leave commented unless you want it.
-        // maybeSubscribeTrade(row.mint);
-      }
-
+      // If it didn't parse to buy/sell, we still forward it (UI can ignore if needed)
       pushCache(row);
       broadcast({ type: "row", row });
       return;
     }
 
-    // Otherwise treat as create/new token
+    // Otherwise: treat as create/new token
     const row = normCreate(msg);
 
-    // Subscribe to trades for this mint (optional create SOL gate)
-    if (row.mint && row.sol >= MIN_SOL_CREATE_TO_TRACK) {
+    // Auto-subscribe to trades for this mint if it passes the create SOL threshold
+    if (row.sol >= MIN_SOL_CREATE_TO_TRACK) {
       maybeSubscribeTrade(row.mint);
     }
 
@@ -216,7 +214,7 @@ function connectUpstream() {
     upstreamConnected = false;
     try {
       if (upstream && upstream._keepAlive) clearInterval(upstream._keepAlive);
-    } catch (_) {}
+    } catch {}
     upstream = null;
     setTimeout(connectUpstream, RECONNECT_MS);
   });
@@ -224,21 +222,39 @@ function connectUpstream() {
   upstream.on("error", (err) => {
     console.log("[UPSTREAM] Error:", err?.message || err);
     upstreamConnected = false;
-    // close handler will reconnect if it closes; if it doesn't, we still keep trying on next close.
+    // let close/reconnect handle
   });
 }
 
 // ====== DOWNSTREAM WS SERVER ======
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: "/ws" });
 
-wss.on("connection", (ws) => {
+// IMPORTANT: no fixed path here.
+// We accept both "/" and "/ws" so your Framer WS_URL can be either:
+//   wss://yourapp.up.railway.app
+//   wss://yourapp.up.railway.app/ws
+const wss = new WebSocket.Server({ server });
+
+wss.on("connection", (ws, req) => {
+  const path = (req && req.url) || "/";
+  if (!(path === "/" || path.startsWith("/ws"))) {
+    try {
+      ws.close();
+    } catch {}
+    return;
+  }
+
   downstreamClients.add(ws);
 
   // Send initial snapshot
   try {
-    ws.send(JSON.stringify({ type: "batch", rows: cachedRows.slice(-CACHE_LIMIT) }));
-  } catch (_) {}
+    ws.send(
+      JSON.stringify({
+        type: "batch",
+        rows: cachedRows.slice(-CACHE_LIMIT),
+      })
+    );
+  } catch {}
 
   ws.on("close", () => downstreamClients.delete(ws));
   ws.on("error", () => downstreamClients.delete(ws));
@@ -254,7 +270,8 @@ app.get("/health", (req, res) => {
     cacheLimit: CACHE_LIMIT,
     tradeSubLimit: TRADE_SUB_LIMIT,
     trackingMints: subscribedTradeMints.size,
-    minSolCreateToTrack: MIN_SOL_CREATE_TO_TRACK,
+    minCreateSolToTrack: MIN_SOL_CREATE_TO_TRACK,
+    upstream: UPSTREAM_WS,
   });
 });
 
