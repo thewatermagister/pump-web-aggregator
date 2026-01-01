@@ -41,8 +41,8 @@ const cachedRows = [];
 const subscribedTradeMints = new Set();
 const subscribedTradeQueue = [];
 
-// Metadata map: mint → {name, symbol}
-const mintMetadata = {};
+// NEW: In-memory metadata cache for token name/symbol
+const mintMetadata = new Map();
 
 // ====== HELPERS ======
 function pushCache(row) {
@@ -63,44 +63,53 @@ function broadcast(obj) {
 
 // Normalize CREATE (new token)
 function normCreate(msg) {
-  const row = {
+  const mint = msg.mint || msg.tokenAddress || msg.ca || "";
+  const name = msg.name || msg.tokenName || "";
+  const symbol = msg.symbol || msg.ticker || "";
+
+  // Store metadata for future trades
+  if (mint && (name || symbol)) {
+    mintMetadata.set(mint, { name, symbol });
+  }
+
+  return {
     kind: "create",
     t: Date.now(),
-    mint: msg.mint || msg.tokenAddress || msg.ca || "",
-    // PumpPortal commonly uses traderPublicKey:
+    mint,
     trader: msg.traderPublicKey || msg.trader || msg.owner || msg.deployer || "",
     sol: Number(msg.solAmount ?? msg.sol ?? 0),
-    name: msg.name || msg.tokenName || "",
-    symbol: msg.symbol || msg.ticker || "",
+    name,
+    symbol,
     raw: msg,
   };
-  // Store metadata
-  if (row.mint && (row.name || row.symbol)) {
-    mintMetadata[row.mint] = { name: row.name, symbol: row.symbol };
-  }
-  return row;
 }
 
 // Normalize TRADE (buy/sell)
 function normTrade(msg) {
   const side = (msg.txType || msg.side || "").toLowerCase(); // buy/sell
-  const row = {
+  const mint = msg.mint || msg.tokenAddress || msg.ca || "";
+
+  let name = msg.name || "";
+  let symbol = msg.symbol || "";
+
+  // Enrich with cached metadata from create event
+  const cached = mintMetadata.get(mint);
+  if (cached) {
+    name = cached.name || name;
+    symbol = cached.symbol || symbol;
+  }
+
+  return {
     kind: "trade",
     t: Date.now(),
-    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    mint,
     trader: msg.traderPublicKey || msg.trader || msg.owner || "",
-    side, // "buy" | "sell"
+    side,
     sol: Number(msg.solAmount ?? msg.sol ?? 0),
-    name: msg.name || "",
-    symbol: msg.symbol || "",
+    name,
+    symbol,
     raw: msg,
   };
-  // Apply metadata if available
-  if (row.mint && mintMetadata[row.mint]) {
-    row.name = mintMetadata[row.mint].name || row.name;
-    row.symbol = mintMetadata[row.mint].symbol || row.symbol;
-  }
-  return row;
 }
 
 function maybeSubscribeTrade(mint) {
@@ -110,9 +119,17 @@ function maybeSubscribeTrade(mint) {
   subscribedTradeMints.add(mint);
   subscribedTradeQueue.push(mint);
 
+  // LRU eviction
   while (subscribedTradeQueue.length > TRADE_SUB_LIMIT) {
     const oldest = subscribedTradeQueue.shift();
     subscribedTradeMints.delete(oldest);
+
+    // Optional: unsubscribe from upstream (PumpPortal supports it)
+    if (upstream && upstream.readyState === WebSocket.OPEN) {
+      try {
+        upstream.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [oldest] }));
+      } catch (e) {}
+    }
   }
 
   if (upstream && upstream.readyState === WebSocket.OPEN) {
@@ -124,18 +141,14 @@ function maybeSubscribeTrade(mint) {
 }
 
 function classifyMsg(msg) {
-  // PumpPortal uses txType: "create" | "buy" | "sell"
   const tx = typeof msg.txType === "string" ? msg.txType.toLowerCase() : "";
 
   if (tx === "buy" || tx === "sell") return "trade";
   if (tx === "create") return "create";
 
-  // fallback heuristics if txType missing:
-  // if it has explicit buy/sell-like fields:
   const side = (msg.side || "").toLowerCase();
   if (side === "buy" || side === "sell") return "trade";
 
-  // default: treat as create-ish
   return "create";
 }
 
@@ -155,19 +168,32 @@ function connectUpstream() {
     upstreamConnected = true;
     console.log("[UPSTREAM] Connected");
 
-    // Always subscribe to new token creation events
+    // Subscribe to new tokens
     try {
       upstream.send(JSON.stringify({ method: "subscribeNewToken" }));
     } catch (e) {}
 
-    // Keepalive ping (protocol-level)
-    if (!upstream._keepAlive) {
-      upstream._keepAlive = setInterval(() => {
+    // Resubscribe to existing trade subscriptions after reconnect
+    if (subscribedTradeMints.size > 0) {
+      const mints = Array.from(subscribedTradeMints);
+      const chunkSize = 50;
+      for (let i = 0; i < mints.length; i += chunkSize) {
+        const chunk = mints.slice(i, i + chunkSize);
         try {
-          if (upstream && upstream.readyState === WebSocket.OPEN) upstream.ping();
+          upstream.send(JSON.stringify({ method: "subscribeTokenTrade", keys: chunk }));
         } catch (e) {}
-      }, 25000);
+      }
     }
+
+    // Keepalive
+    if (upstream._keepAlive) clearInterval(upstream._keepAlive);
+    upstream._keepAlive = setInterval(() => {
+      if (upstream.readyState === WebSocket.OPEN) {
+        try {
+          upstream.ping();
+        } catch (e) {}
+      }
+    }, 25000);
   });
 
   upstream.on("message", (data) => {
@@ -190,7 +216,6 @@ function connectUpstream() {
     // create
     const row = normCreate(msg);
 
-    // subscribe to trades for this token if it passes threshold
     if (row.sol >= MIN_SOL_CREATE_TO_TRACK) {
       maybeSubscribeTrade(row.mint);
     }
@@ -202,9 +227,10 @@ function connectUpstream() {
   upstream.on("close", () => {
     console.log("[UPSTREAM] Closed");
     upstreamConnected = false;
-    try {
-      if (upstream && upstream._keepAlive) clearInterval(upstream._keepAlive);
-    } catch (e) {}
+    if (upstream._keepAlive) {
+      clearInterval(upstream._keepAlive);
+      upstream._keepAlive = null;
+    }
     upstream = null;
     setTimeout(connectUpstream, RECONNECT_MS);
   });
@@ -222,7 +248,7 @@ const wss = new WebSocket.Server({ server, path: "/ws" });
 wss.on("connection", (ws) => {
   downstreamClients.add(ws);
 
-  // Send initial snapshot
+  // Send initial snapshot (newest first)
   try {
     ws.send(
       JSON.stringify({
