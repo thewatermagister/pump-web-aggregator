@@ -1,5 +1,6 @@
 // server.js
 // Pump Web Aggregator: 1 upstream WS → many downstream website clients
+// Fix: cache mint -> (name,symbol) from create events so trade rows can show name/symbol too.
 
 const express = require("express");
 const cors = require("cors");
@@ -39,7 +40,11 @@ const cachedRows = [];
 
 // Keep track of which mints we already subscribed to for trades
 const subscribedTradeMints = new Set();
+// Also keep insertion order so we can drop oldest
 const subscribedTradeQueue = [];
+
+// ✅ Mint metadata cache: mint -> { name, symbol }
+const mintMeta = new Map();
 
 // ====== HELPERS ======
 function pushCache(row) {
@@ -53,38 +58,102 @@ function broadcast(obj) {
     if (client.readyState === WebSocket.OPEN) {
       try {
         client.send(msg);
-      } catch (e) {}
+      } catch (e) {
+        // ignore send errors
+      }
     }
   }
 }
 
-// Normalize CREATE (new token)
+function pickMint(msg) {
+  return msg.mint || msg.tokenAddress || msg.ca || msg.address || "";
+}
+
+function pickTrader(msg) {
+  // PumpPortal varies field names across events
+  return (
+    msg.trader ||
+    msg.traderPublicKey ||
+    msg.owner ||
+    msg.user ||
+    msg.deployer ||
+    msg.from ||
+    ""
+  );
+}
+
+function pickSol(msg) {
+  const v = msg.solAmount ?? msg.sol ?? msg.amountSol ?? msg.amount ?? 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function pickName(msg) {
+  return msg.name || msg.tokenName || msg.meta?.name || "";
+}
+
+function pickSymbol(msg) {
+  return msg.symbol || msg.ticker || msg.meta?.symbol || "";
+}
+
+function rememberMeta(mint, name, symbol) {
+  if (!mint) return;
+
+  const prev = mintMeta.get(mint) || { name: "", symbol: "" };
+  const next = {
+    name: (name && String(name).trim()) || prev.name || "",
+    symbol: (symbol && String(symbol).trim()) || prev.symbol || "",
+  };
+
+  // Only store if we have something useful
+  if (next.name || next.symbol) mintMeta.set(mint, next);
+}
+
+function getMeta(mint) {
+  return mintMeta.get(mint) || { name: "", symbol: "" };
+}
+
 function normCreate(msg) {
+  const mint = pickMint(msg);
+  const name = pickName(msg);
+  const symbol = pickSymbol(msg);
+
+  // ✅ Store meta so trades can display name/symbol later
+  rememberMeta(mint, name, symbol);
+
   return {
     kind: "create",
     t: Date.now(),
-    mint: msg.mint || msg.tokenAddress || msg.ca || "",
-    // PumpPortal commonly uses traderPublicKey:
-    trader: msg.traderPublicKey || msg.trader || msg.owner || msg.deployer || "",
-    sol: Number(msg.solAmount ?? msg.sol ?? 0),
-    name: msg.name || msg.tokenName || "",
-    symbol: msg.symbol || msg.ticker || "",
+    mint,
+    trader: pickTrader(msg),
+    sol: pickSol(msg),
+    name,
+    symbol,
     raw: msg,
   };
 }
 
-// Normalize TRADE (buy/sell)
 function normTrade(msg) {
-  const side = (msg.txType || msg.side || "").toLowerCase(); // buy/sell
+  const mint = pickMint(msg);
+  const side = (msg.txType || msg.side || msg.tradeType || "").toLowerCase(); // buy/sell
+
+  // ✅ Many trade msgs don't have name/symbol — fill from cache
+  const meta = getMeta(mint);
+  const name = pickName(msg) || meta.name || "";
+  const symbol = pickSymbol(msg) || meta.symbol || "";
+
+  // If trade contains name/symbol (rare), update cache too
+  rememberMeta(mint, name, symbol);
+
   return {
     kind: "trade",
     t: Date.now(),
-    mint: msg.mint || msg.tokenAddress || msg.ca || "",
-    trader: msg.traderPublicKey || msg.trader || msg.owner || "",
-    side, // "buy" | "sell"
-    sol: Number(msg.solAmount ?? msg.sol ?? 0),
-    name: msg.name || "",
-    symbol: msg.symbol || "",
+    mint,
+    trader: pickTrader(msg),
+    side,
+    sol: pickSol(msg),
+    name,
+    symbol,
     raw: msg,
   };
 }
@@ -99,6 +168,8 @@ function maybeSubscribeTrade(mint) {
   while (subscribedTradeQueue.length > TRADE_SUB_LIMIT) {
     const oldest = subscribedTradeQueue.shift();
     subscribedTradeMints.delete(oldest);
+    // Note: PumpPortal may or may not support "unsubscribe".
+    // We simply stop tracking old mints locally.
   }
 
   if (upstream && upstream.readyState === WebSocket.OPEN) {
@@ -107,22 +178,6 @@ function maybeSubscribeTrade(mint) {
       upstream.send(JSON.stringify(payload));
     } catch (e) {}
   }
-}
-
-function classifyMsg(msg) {
-  // PumpPortal uses txType: "create" | "buy" | "sell"
-  const tx = typeof msg.txType === "string" ? msg.txType.toLowerCase() : "";
-
-  if (tx === "buy" || tx === "sell") return "trade";
-  if (tx === "create") return "create";
-
-  // fallback heuristics if txType missing:
-  // if it has explicit buy/sell-like fields:
-  const side = (msg.side || "").toLowerCase();
-  if (side === "buy" || side === "sell") return "trade";
-
-  // default: treat as create-ish
-  return "create";
 }
 
 function connectUpstream() {
@@ -141,12 +196,12 @@ function connectUpstream() {
     upstreamConnected = true;
     console.log("[UPSTREAM] Connected");
 
-    // Always subscribe to new token creation events
+    // 1) Always subscribe to new token creation events
     try {
       upstream.send(JSON.stringify({ method: "subscribeNewToken" }));
     } catch (e) {}
 
-    // Keepalive ping (protocol-level)
+    // Keepalive ping
     if (!upstream._keepAlive) {
       upstream._keepAlive = setInterval(() => {
         try {
@@ -164,19 +219,23 @@ function connectUpstream() {
       return;
     }
 
-    const type = classifyMsg(msg);
+    // Detect trade:
+    const isTrade =
+      typeof msg.txType === "string" ||
+      msg.type === "trade" ||
+      msg.event === "trade";
 
-    if (type === "trade") {
+    if (isTrade) {
       const row = normTrade(msg);
       pushCache(row);
       broadcast({ type: "row", row });
       return;
     }
 
-    // create
+    // Otherwise treat as create/new token
     const row = normCreate(msg);
 
-    // subscribe to trades for this token if it passes threshold
+    // Optional: only subscribe trades for tokens above some deploy SOL
     if (row.sol >= MIN_SOL_CREATE_TO_TRACK) {
       maybeSubscribeTrade(row.mint);
     }
@@ -222,12 +281,21 @@ wss.on("connection", (ws) => {
   ws.on("error", () => downstreamClients.delete(ws));
 });
 
-app.get("/", (_req, res) => res.send("FoxScan aggregator OK"));
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, upstreamConnected, cached: cachedRows.length })
-);
+// ====== HTTP ROUTES ======
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    pumpConnected: upstreamConnected,
+    clients: downstreamClients.size,
+    cachedRows: cachedRows.length,
+    tradeSubLimit: TRADE_SUB_LIMIT,
+    trackingMints: subscribedTradeMints.size,
+    metaMints: mintMeta.size,
+  });
+});
 
+// ====== START ======
 server.listen(PORT, () => {
-  console.log(`[SERVER] Listening on :${PORT}`);
+  console.log(`[HTTP] Listening on :${PORT}`);
   connectUpstream();
 });
