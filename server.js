@@ -1,233 +1,247 @@
 // server.js
-import express from "express";
-import cors from "cors";
-import WebSocket, { WebSocketServer } from "ws";
-import http from "http";
+// Pump Web Aggregator: 1 upstream WS → many downstream website clients
 
-const PORT = process.env.PORT || 8080;
-
-// >>> IMPORTANT: set this to whatever upstream pump websocket you’re using now.
-// If you already had a working upstream in your stable version, put that exact URL here.
-// Example placeholders:
-// const UPSTREAM_WS = "wss://pumpportal.fun/api/data";
-const UPSTREAM_WS = process.env.UPSTREAM_WS || "wss://pumpportal.fun/api/data";
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const WebSocket = require("ws");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+// ====== CONFIG ======
+const PORT = process.env.PORT || 8080;
 
-// --- In-memory cache ---
-const MAX_CACHE = parseInt(process.env.MAX_CACHE || "5000", 10);
-const ROW_BOOTSTRAP = parseInt(process.env.ROW_BOOTSTRAP || "200", 10);
+// Upstream PumpPortal socket
+const UPSTREAM_WS = process.env.UPSTREAM_WS || "wss://pumpportal.fun/api/data";
 
-let cachedRows = [];                 // ring buffer of latest rows
-const mintMeta = new Map();          // mint -> { name, symbol, updatedAt }
+// How many rows to keep in memory for new clients ("batch" send)
+const CACHE_LIMIT = Number(process.env.CACHE_LIMIT || 200);
 
-let pumpWS = null;
-let pumpConnected = false;
+// How many *recent tokens* we auto-subscribe to for trades
+const TRADE_SUB_LIMIT = Number(process.env.TRADE_SUB_LIMIT || 150);
 
-function pushRow(row) {
+// Optional: only subscribe trades after a token is created AND it passes this SOL filter (create event sol)
+const MIN_SOL_CREATE_TO_TRACK = Number(process.env.MIN_SOL_CREATE_TO_TRACK || 0);
+
+// Reconnect timing
+const RECONNECT_MS = Number(process.env.RECONNECT_MS || 2000);
+
+// ====== STATE ======
+let upstream = null;
+let upstreamConnected = false;
+
+const downstreamClients = new Set();
+
+// Rolling cache of normalized rows
+const cachedRows = [];
+
+// Keep track of which mints we already subscribed to for trades
+const subscribedTradeMints = new Set();
+const subscribedTradeQueue = [];
+
+// Metadata map: mint → {name, symbol}
+const mintMetadata = {};
+
+// ====== HELPERS ======
+function pushCache(row) {
   cachedRows.push(row);
-  if (cachedRows.length > MAX_CACHE) cachedRows.shift();
+  if (cachedRows.length > CACHE_LIMIT) cachedRows.shift();
 }
 
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  for (const client of downstreamClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(msg);
+      } catch (e) {}
+    }
   }
 }
 
-function shortAddr(a) {
-  if (!a || typeof a !== "string") return "-";
-  return a.length > 10 ? `${a.slice(0, 5)}…${a.slice(-4)}` : a;
+// Normalize CREATE (new token)
+function normCreate(msg) {
+  const row = {
+    kind: "create",
+    t: Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    // PumpPortal commonly uses traderPublicKey:
+    trader: msg.traderPublicKey || msg.trader || msg.owner || msg.deployer || "",
+    sol: Number(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || msg.tokenName || "",
+    symbol: msg.symbol || msg.ticker || "",
+    raw: msg,
+  };
+  // Store metadata
+  if (row.mint && (row.name || row.symbol)) {
+    mintMetadata[row.mint] = { name: row.name, symbol: row.symbol };
+  }
+  return row;
 }
 
-function nowTs() {
-  return Date.now();
+// Normalize TRADE (buy/sell)
+function normTrade(msg) {
+  const side = (msg.txType || msg.side || "").toLowerCase(); // buy/sell
+  const row = {
+    kind: "trade",
+    t: Date.now(),
+    mint: msg.mint || msg.tokenAddress || msg.ca || "",
+    trader: msg.traderPublicKey || msg.trader || msg.owner || "",
+    side, // "buy" | "sell"
+    sol: Number(msg.solAmount ?? msg.sol ?? 0),
+    name: msg.name || "",
+    symbol: msg.symbol || "",
+    raw: msg,
+  };
+  // Apply metadata if available
+  if (row.mint && mintMetadata[row.mint]) {
+    row.name = mintMetadata[row.mint].name || row.name;
+    row.symbol = mintMetadata[row.mint].symbol || row.symbol;
+  }
+  return row;
 }
 
-function fmtTime(ms) {
-  try {
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "";
+function maybeSubscribeTrade(mint) {
+  if (!mint) return;
+  if (subscribedTradeMints.has(mint)) return;
+
+  subscribedTradeMints.add(mint);
+  subscribedTradeQueue.push(mint);
+
+  while (subscribedTradeQueue.length > TRADE_SUB_LIMIT) {
+    const oldest = subscribedTradeQueue.shift();
+    subscribedTradeMints.delete(oldest);
+  }
+
+  if (upstream && upstream.readyState === WebSocket.OPEN) {
+    const payload = { method: "subscribeTokenTrade", keys: [mint] };
+    try {
+      upstream.send(JSON.stringify(payload));
+    } catch (e) {}
   }
 }
 
-// --- Upstream connect/reconnect ---
+function classifyMsg(msg) {
+  // PumpPortal uses txType: "create" | "buy" | "sell"
+  const tx = typeof msg.txType === "string" ? msg.txType.toLowerCase() : "";
+
+  if (tx === "buy" || tx === "sell") return "trade";
+  if (tx === "create") return "create";
+
+  // fallback heuristics if txType missing:
+  // if it has explicit buy/sell-like fields:
+  const side = (msg.side || "").toLowerCase();
+  if (side === "buy" || side === "sell") return "trade";
+
+  // default: treat as create-ish
+  return "create";
+}
+
 function connectUpstream() {
-  if (pumpWS && (pumpWS.readyState === WebSocket.OPEN || pumpWS.readyState === WebSocket.CONNECTING)) {
+  if (
+    upstream &&
+    (upstream.readyState === WebSocket.OPEN ||
+      upstream.readyState === WebSocket.CONNECTING)
+  ) {
     return;
   }
 
-  pumpWS = new WebSocket(UPSTREAM_WS);
+  console.log("[UPSTREAM] Connecting:", UPSTREAM_WS);
+  upstream = new WebSocket(UPSTREAM_WS);
 
-  pumpWS.on("open", () => {
-    pumpConnected = true;
-    console.log("[UPSTREAM] connected");
+  upstream.on("open", () => {
+    upstreamConnected = true;
+    console.log("[UPSTREAM] Connected");
 
-    // If your upstream requires subscription messages, keep them HERE.
-    // Because your current deploy already shows pumpConnected:true,
-    // you likely already have a correct subscribe block in your stable server.
-    //
-    // Example patterns (ONLY enable the one your upstream uses):
-    //
-    // pumpWS.send(JSON.stringify({ method: "subscribeNewToken" }));
-    // pumpWS.send(JSON.stringify({ method: "subscribeTokenTrade" }));
-    //
-    // If your stable server had a specific subscribe payload, paste it here.
+    // Always subscribe to new token creation events
+    try {
+      upstream.send(JSON.stringify({ method: "subscribeNewToken" }));
+    } catch (e) {}
+
+    // Keepalive ping (protocol-level)
+    if (!upstream._keepAlive) {
+      upstream._keepAlive = setInterval(() => {
+        try {
+          if (upstream && upstream.readyState === WebSocket.OPEN) upstream.ping();
+        } catch (e) {}
+      }, 25000);
+    }
   });
 
-  pumpWS.on("close", () => {
-    pumpConnected = false;
-    console.log("[UPSTREAM] disconnected - retrying in 2s");
-    setTimeout(connectUpstream, 2000);
-  });
-
-  pumpWS.on("error", (err) => {
-    pumpConnected = false;
-    console.log("[UPSTREAM] error", err?.message || err);
-    try { pumpWS.close(); } catch {}
-  });
-
-  pumpWS.on("message", (buf) => {
+  upstream.on("message", (data) => {
     let msg;
     try {
-      msg = JSON.parse(buf.toString());
-    } catch {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
       return;
     }
 
-    // -----------------------------
-    // Normalize upstream payloads
-    // -----------------------------
-    // We handle two categories:
-    // 1) CREATE (new token) => typeLabel: "Dev"
-    // 2) TRADE (buy/sell)   => typeLabel: "Buy" | "Sell"
-    //
-    // Since upstream formats differ, we look for common fields.
-    //
-    // If your upstream has exact field names, you can tighten this later.
+    const type = classifyMsg(msg);
 
-    // Heuristics:
-    const isCreate =
-      msg?.type === "create" ||
-      msg?.event === "create" ||
-      msg?.kind === "create" ||
-      msg?.txType === "create" ||
-      (msg?.name && msg?.symbol && msg?.mint && !msg?.side && !msg?.isBuy && !msg?.isSell);
-
-    const isTrade =
-      msg?.type === "trade" ||
-      msg?.event === "trade" ||
-      msg?.kind === "trade" ||
-      msg?.txType === "trade" ||
-      msg?.side === "buy" ||
-      msg?.side === "sell" ||
-      typeof msg?.isBuy === "boolean" ||
-      typeof msg?.isSell === "boolean";
-
-    if (isCreate) {
-      const mint = msg.mint || msg.tokenMint || msg.ca || msg.contract || msg.address;
-      const name = msg.name || msg.tokenName || "-";
-      const symbol = msg.symbol || msg.ticker || "-";
-      const trader = msg.trader || msg.owner || msg.creator || msg.deployer || "-";
-      const sol = Number(msg.sol ?? msg.amountSOL ?? msg.initialBuy ?? msg.devSol ?? 0) || 0;
-
-      if (mint) {
-        mintMeta.set(mint, { name, symbol, updatedAt: nowTs() });
-      }
-
-      const row = {
-        kind: "create",                 // for logic
-        typeLabel: "Dev",               // for UI display (what you want in Type column)
-        side: null,                     // not used for create
-        t: nowTs(),
-        time: fmtTime(nowTs()),
-        wallet: trader,
-        walletShort: shortAddr(trader),
-        mint,
-        mintShort: shortAddr(mint),
-        sol,
-        name,
-        symbol,
-      };
-
-      pushRow(row);
+    if (type === "trade") {
+      const row = normTrade(msg);
+      pushCache(row);
       broadcast({ type: "row", row });
       return;
     }
 
-    if (isTrade) {
-      const mint = msg.mint || msg.tokenMint || msg.ca || msg.contract || msg.address;
-      const trader = msg.trader || msg.owner || msg.wallet || msg.buyer || msg.seller || "-";
-      const sol = Number(msg.sol ?? msg.amountSOL ?? msg.amount ?? 0) || 0;
+    // create
+    const row = normCreate(msg);
 
-      // Determine side
-      let side = msg.side;
-      if (!side) {
-        if (msg.isBuy === true) side = "buy";
-        else if (msg.isSell === true) side = "sell";
-      }
-      if (side !== "buy" && side !== "sell") {
-        // if unknown, mark as trade but default to buy (you can change this)
-        side = "buy";
-      }
-
-      // Pull name/symbol from cache if we have it
-      const meta = mint ? mintMeta.get(mint) : null;
-      const name = msg.name || meta?.name || "-";
-      const symbol = msg.symbol || meta?.symbol || "-";
-
-      const row = {
-        kind: "trade",                  // for logic
-        typeLabel: side === "buy" ? "Buy" : "Sell", // UI display label
-        side,                           // for filtering if needed
-        t: nowTs(),
-        time: fmtTime(nowTs()),
-        wallet: trader,
-        walletShort: shortAddr(trader),
-        mint,
-        mintShort: shortAddr(mint),
-        sol,
-        name,
-        symbol,
-      };
-
-      pushRow(row);
-      broadcast({ type: "row", row });
-      return;
+    // subscribe to trades for this token if it passes threshold
+    if (row.sol >= MIN_SOL_CREATE_TO_TRACK) {
+      maybeSubscribeTrade(row.mint);
     }
 
-    // Ignore unknown upstream messages
+    pushCache(row);
+    broadcast({ type: "row", row });
+  });
+
+  upstream.on("close", () => {
+    console.log("[UPSTREAM] Closed");
+    upstreamConnected = false;
+    try {
+      if (upstream && upstream._keepAlive) clearInterval(upstream._keepAlive);
+    } catch (e) {}
+    upstream = null;
+    setTimeout(connectUpstream, RECONNECT_MS);
+  });
+
+  upstream.on("error", (err) => {
+    console.log("[UPSTREAM] Error:", err?.message || err);
+    upstreamConnected = false;
   });
 }
 
-// --- Health endpoint ---
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    pumpConnected,
-    clients: wss.clients.size,
-    cachedRows: cachedRows.length,
-    cachedMints: mintMeta.size,
-  });
-});
+// ====== DOWNSTREAM WS SERVER ======
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
-// --- WS downstream for your Framer page ---
 wss.on("connection", (ws) => {
-  // Send last N rows immediately (bootstrap)
-  const rows = cachedRows.slice(-ROW_BOOTSTRAP);
-  ws.send(JSON.stringify({ type: "batch", rows }));
+  downstreamClients.add(ws);
 
-  ws.on("error", () => {});
+  // Send initial snapshot
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "batch",
+        rows: cachedRows.slice(-CACHE_LIMIT),
+      })
+    );
+  } catch (e) {}
+
+  ws.on("close", () => downstreamClients.delete(ws));
+  ws.on("error", () => downstreamClients.delete(ws));
 });
+
+app.get("/", (_req, res) => res.send("FoxScan aggregator OK"));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, upstreamConnected, cached: cachedRows.length })
+);
 
 server.listen(PORT, () => {
-  console.log(`[SERVER] listening on :${PORT}`);
+  console.log(`[SERVER] Listening on :${PORT}`);
   connectUpstream();
 });
